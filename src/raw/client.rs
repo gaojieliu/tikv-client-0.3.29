@@ -6,7 +6,7 @@ use std::ops::Bound;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use log::{debug, info};
+use log::debug;
 use tokio::time::sleep;
 
 use crate::backoff::{DEFAULT_REGION_BACKOFF, DEFAULT_STORE_BACKOFF};
@@ -288,9 +288,7 @@ impl<PdC: PdClient> Client<PdC> {
     pub async fn batch_get_optimized(
         &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
-    ) -> Result<Vec<KvPair>> {
-        info!("invoking raw batch_get_optimized request");
-        
+    ) -> Result<Vec<KvPair>> {        
         // Step 1: Encode keys with keyspace
         let keys: Vec<Key> = keys
             .into_iter()
@@ -307,7 +305,6 @@ impl<PdC: PdClient> Client<PdC> {
             let region = self.rpc.clone().region_for_key(&key).await?;
             // Get store ID for this region
             let store_id = region.get_store_id()?;
-            info!("Mapping key {:?} to region {:?} and store {:?}", key, region.id(), store_id);
             requested_store_set.insert(store_id);
             if !store_client_map.contains_key(&store_id) {
                 let region_store = self.rpc.clone().store_for_id(region.id()).await?;
@@ -347,7 +344,6 @@ impl<PdC: PdClient> Client<PdC> {
             
             let task = tokio::spawn(async move {
                 // // Send request directly to store
-                info!("Sending raw batch_get_optimized request to store {:?}", store_id);
                 let response_box = store.client
                     .dispatch(&req)
                     .await?;
@@ -367,7 +363,6 @@ impl<PdC: PdClient> Client<PdC> {
                     .into_iter()
                     .map(|pair| KvPair(pair.key.into(), pair.value))
                     .collect();
-                info!("Received raw batch_get_optimized response from store {:?}", store_id);
                 
                 Ok::<Vec<KvPair>, Error>(pairs)
             });
@@ -388,7 +383,6 @@ impl<PdC: PdClient> Client<PdC> {
             .into_iter()
             .map(|pair| pair.truncate_keyspace(self.keyspace))
             .collect();
-        info!("Completed raw batch_get_optimized request with {} results", result.len());
         
         Ok(result)
     }
