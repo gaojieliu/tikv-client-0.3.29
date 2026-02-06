@@ -154,6 +154,10 @@ impl StoreShardable for kvrpcpb::RawBatchGetOptimizedRequest {
         self.regions = shard;
         Ok(())
     }
+    
+    fn get_store_shard_region_ids(&self) -> Vec<u64> {
+        self.regions.iter().map(|region_keys| region_keys.region_id).collect()
+    }
 }
 
 pub fn new_raw_get_key_ttl_request(

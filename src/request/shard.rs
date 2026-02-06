@@ -54,6 +54,9 @@ pub trait StoreShardable {
     ) -> BoxStream<'static, Result<(Self::StoreShard, Store)>>;
     
     fn apply_store_shard(&mut self, shard: Self::StoreShard, store: &Store) -> Result<()>;
+
+    fn get_store_shard_region_ids(&self) -> Vec<u64>;
+    
 }
 
 pub trait Batchable {
@@ -123,6 +126,10 @@ impl<Req: KvRequest + StoreShardable> StoreShardable for Dispatch<Req> {
     fn apply_store_shard(&mut self, shard: Self::StoreShard, store: &Store) -> Result<()> {
         self.kv_client = Some(store.client.clone());
         self.request.apply_store_shard(shard, store)
+    }
+    
+    fn get_store_shard_region_ids(&self) -> Vec<u64> {
+        self.request.get_store_shard_region_ids()
     }
 }
 

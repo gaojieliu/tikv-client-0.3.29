@@ -33,7 +33,7 @@ use crate::transaction::HasLocks;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
 use crate::util::iter::FlatMapOkIterExt;
-use crate::Error;
+use crate::{Error, region};
 use crate::Result;
 
 use super::keyspace::Keyspace;
@@ -478,23 +478,14 @@ where
             Ok(resp) => resp,
             Err(e) if is_grpc_error(&e) => {
                 info!("gRPC error: {:?}, retrying...", e);
-                match backoff.next_delay_duration() {
-                    Some(duration) => {
-                        sleep(duration).await;
-                        return Self::store_plan_handler(
-                            pd_client,
-                            plan,
-                            backoff,
-                            permits,
-                            preserve_store_results,
-                        )
-                        .await;
-                    }
-                    None => {
-                        info!("Max retry attempts reached for gRPC error");
-                        return Err(e);
-                    }
-                }
+                return Self::handle_store_grpc_error(
+                    pd_client,
+                    plan,
+                    backoff,
+                    permits,
+                    preserve_store_results,
+                    e,
+                ).await;
             }
             Err(e) => return Err(e),
         };
@@ -531,6 +522,42 @@ where
             }
         } else {
             Ok(vec![Ok(resp)])
+        }
+    }
+
+    async fn handle_store_grpc_error(
+        pd_client: Arc<PdC>,
+        plan: P,
+        mut backoff: Backoff,
+        permits: Arc<Semaphore>,
+        preserve_store_results: bool,
+        e: Error,
+    ) -> Result<<Self as Plan>::Result> {
+        debug!("handle grpc error: {:?}", e);
+        // Get all the regions sending to this store
+        let region_ids = plan.get_store_shard_region_ids();
+        for region_id in region_ids {
+            let region_with_leader = pd_client.clone().region_for_id(region_id).await;
+            if let Err(e) = &region_with_leader {
+                info!("Failed to get region for id {}: {:?}", region_id, e);
+                continue;
+            }
+            let ver_id = region_with_leader.unwrap().ver_id();
+            pd_client.invalidate_region_cache(ver_id).await;
+        }
+        match backoff.next_delay_duration() {
+            Some(duration) => {
+                sleep(duration).await;
+                Self::store_plan_handler(
+                        pd_client,
+                        plan,
+                        backoff,
+                        permits,
+                        preserve_store_results,
+                    )
+                    .await
+            }
+            None => Err(e),
         }
     }
 
