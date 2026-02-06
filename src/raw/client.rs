@@ -285,6 +285,25 @@ impl<PdC: PdClient> Client<PdC> {
         })
     }
 
+    pub async fn batch_get_optimized_new(
+        &self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> Result<Vec<KvPair>> {
+        let keys = keys
+            .into_iter()
+            .map(|k| k.into().encode_keyspace(self.keyspace, KeyMode::Raw));
+        let request = new_raw_batch_get_optimized_request(keys, self.cf.clone());
+        let plan = crate::request::PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .retry_multi_store(self.backoff.clone())
+            .merge(Collect)
+            .plan();
+        plan.execute().await.map(|r| {
+            r.into_iter()
+                .map(|pair| pair.truncate_keyspace(self.keyspace))
+                .collect()
+        })
+    }
+
     pub async fn batch_get_optimized(
         &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,

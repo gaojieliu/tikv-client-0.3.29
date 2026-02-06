@@ -26,6 +26,12 @@ use crate::BoundRange;
 use crate::Key;
 use crate::Result;
 
+use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::{HashMap, HashSet};
+use crate::proto::kvrpcpb::RegionKeys;
+use crate::Error;
+
+
 #[derive(new, Clone)]
 pub struct RegionStore {
     pub region_with_leader: RegionWithLeader,
@@ -57,6 +63,81 @@ where
                 .map_ok(move |store| (key, store))
         })
         .boxed()
+}
+
+pub fn store_stream_for_keys_by_store_with_region_info(
+    keys: impl Iterator<Item = Vec<u8>> + Send + Sync + 'static,
+    pd_client: Arc<impl PdClient>,
+) -> BoxStream<'static, Result<(Vec<crate::proto::kvrpcpb::RegionKeys>, Store)>> {
+    let keys: Vec<Vec<u8>> = keys.collect();
+    
+    stream::once(async move {
+
+        let mut store_region_keys_map: HashMap<u64, HashMap<u64, RegionKeys>> = HashMap::new();
+        let mut requested_store_set: HashSet<u64> = HashSet::new();
+        let mut store_client_map: HashMap<u64, Store> = HashMap::new();
+        
+        for key in keys {
+            // Get region for each key
+            let key: Key = key.into();
+            let region = pd_client.clone().region_for_key(&key).await?;
+            // Get store ID for this region
+            let store_id = region.get_store_id()?;
+            requested_store_set.insert(store_id);
+            if !store_client_map.contains_key(&store_id) {
+                let region_store = pd_client.clone().store_for_id(region.id()).await?;
+                store_client_map.insert(store_id, Store { client: region_store.client.clone() });
+            }
+
+            let leader_peer = region.leader.as_ref().ok_or(Error::LeaderNotFound { region_id: region.id() })?;
+            store_region_keys_map
+                .entry(store_id)
+                .or_insert_with(HashMap::new)
+                .entry(region.id())
+                .or_insert_with(|| {
+                    let mut region_keys = RegionKeys::default();
+                    region_keys.keys = vec![];
+                    region_keys.region_id = region.id();
+                    region_keys.region_epoch = region.region.region_epoch.clone();
+                    region_keys.peer = Some(leader_peer.clone());
+                    region_keys
+                })
+                .keys.push(key.into());
+        }
+        
+        // Convert the maps into a Vec of Results
+        let results: Vec<Result<(Vec<RegionKeys>, Store)>> = requested_store_set
+            .into_iter()
+            .map(|store_id| {
+                let store = store_client_map
+                    .get(&store_id)
+                    .ok_or_else(|| Error::InternalError {
+                        message: format!("Store {} not found in store_client_map", store_id),
+                    })?
+                    .clone();
+                
+                let region_keys_map = store_region_keys_map
+                    .get(&store_id)
+                    .ok_or_else(|| Error::InternalError {
+                        message: format!("Store {} not found in store_region_keys_map", store_id),
+                    })?;
+                
+                // Convert HashMap<u64, RegionKeys> to Vec<RegionKeys>
+                let region_keys_vec: Vec<RegionKeys> = region_keys_map
+                    .values()
+                    .cloned()
+                    .collect();
+                
+                Ok((region_keys_vec, store))
+            })
+            .collect();
+        
+        Ok::<_, Error>(stream::iter(results))
+
+    })
+    .then(|result| async move { result })
+    .try_flatten()
+    .boxed()
 }
 
 #[allow(clippy::type_complexity)]

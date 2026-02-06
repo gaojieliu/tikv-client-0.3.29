@@ -9,7 +9,7 @@ use crate::backoff::Backoff;
 use crate::pd::PdClient;
 use crate::request::plan::{CleanupLocks, RetryableAllStores};
 use crate::request::shard::HasNextBatch;
-use crate::request::Dispatch;
+use crate::request::{Dispatch, StoreShardable};
 use crate::request::ExtractError;
 use crate::request::KvRequest;
 use crate::request::Merge;
@@ -20,6 +20,7 @@ use crate::request::Process;
 use crate::request::ProcessResponse;
 use crate::request::ResolveLock;
 use crate::request::RetryableMultiRegion;
+use crate::request::RetryableMultiStore;
 use crate::request::Shardable;
 use crate::request::{DefaultProcessor, StoreRequest};
 use crate::store::HasKeyErrors;
@@ -191,6 +192,46 @@ where
         }
     }
 }
+
+impl<PdC: PdClient, P: Plan + StoreShardable> PlanBuilder<PdC, P, NoTarget>
+where
+    P::Result: HasKeyErrors + HasRegionError,
+{
+    /// Split the request into shards sending a request to the region of each shard.
+    pub fn retry_multi_store(
+        self,
+        backoff: Backoff,
+    ) -> PlanBuilder<PdC, RetryableMultiStore<P, PdC>, Targetted> {
+        self.make_retry_multi_store(backoff, false)
+    }
+
+    /// Preserve all results, even some of them are Err.
+    /// To pass all responses to merge, and handle partial successful results correctly.
+    pub fn retry_multi_store_preserve_results(
+        self,
+        backoff: Backoff,
+    ) -> PlanBuilder<PdC, RetryableMultiStore<P, PdC>, Targetted> {
+        self.make_retry_multi_store(backoff, true)
+    }
+
+    fn make_retry_multi_store(
+        self,
+        backoff: Backoff,
+        preserve_store_results: bool,
+    ) -> PlanBuilder<PdC, RetryableMultiStore<P, PdC>, Targetted> {
+        PlanBuilder {
+            pd_client: self.pd_client.clone(),
+            plan: RetryableMultiStore {
+                inner: self.plan,
+                pd_client: self.pd_client,
+                backoff,
+                preserve_store_results,
+            },
+            phantom: PhantomData,
+        }
+    }
+}
+
 
 impl<PdC: PdClient, R: KvRequest> PlanBuilder<PdC, Dispatch<R>, NoTarget> {
     /// Target the request at a single region; caller supplies the store to target.

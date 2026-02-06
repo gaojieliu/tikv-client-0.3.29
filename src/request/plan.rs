@@ -20,6 +20,7 @@ use crate::proto::kvrpcpb;
 use crate::request::shard::HasNextBatch;
 use crate::request::NextBatch;
 use crate::request::Shardable;
+use crate::request::StoreShardable;
 use crate::request::{KvRequest, StoreRequest};
 use crate::stats::tikv_stats;
 use crate::store::HasRegionError;
@@ -359,6 +360,216 @@ where
             self.preserve_region_results,
         )
         .await
+    }
+}
+
+pub struct RetryableMultiStore<P: Plan, PdC: PdClient> {
+    pub(super) inner: P,
+    pub pd_client: Arc<PdC>,
+    pub backoff: Backoff,
+    pub preserve_store_results: bool,
+}
+
+impl<P: Plan, PdC: PdClient> Clone for RetryableMultiStore<P, PdC> {
+    fn clone(&self) -> Self {
+        RetryableMultiStore {
+            inner: self.inner.clone(),
+            pd_client: self.pd_client.clone(),
+            backoff: self.backoff.clone(),
+            preserve_store_results: self.preserve_store_results,
+        }
+    }
+}
+
+#[async_trait]
+impl<P: Plan + StoreShardable, PdC: PdClient> Plan for RetryableMultiStore<P, PdC>
+where
+    P::Result: HasKeyErrors + HasRegionError,
+{
+    type Result = Vec<Result<P::Result>>;
+
+    async fn execute(&self) -> Result<Self::Result> {
+        let concurrency_permits = Arc::new(Semaphore::new(MULTI_STORES_CONCURRENCY));
+        Self::store_plan_handler(
+            self.pd_client.clone(),
+            self.inner.clone(),
+            self.backoff.clone(),
+            concurrency_permits,
+            self.preserve_store_results,
+        )
+        .await
+    }
+}
+
+impl<P: Plan + StoreShardable, PdC: PdClient> RetryableMultiStore<P, PdC>
+where
+    P::Result: HasKeyErrors + HasRegionError,
+{
+    #[async_recursion]
+    async fn store_plan_handler(
+        pd_client: Arc<PdC>,
+        current_plan: P,
+        backoff: Backoff,
+        permits: Arc<Semaphore>,
+        preserve_store_results: bool,
+    ) -> Result<<Self as Plan>::Result> {
+        let shards = current_plan
+            .store_shards(&pd_client)
+            .collect::<Vec<_>>()
+            .await;
+        let mut handles = Vec::new();
+
+        for shard_result in shards {
+            let (shard, store) = shard_result?;
+            // Here, the cloned plan is per store, which means it will only carry the keys for that store
+            // after invoking `apply_store_shard`.
+            // So when error happens, the retry logic in single_store_shard_handler will only retry the keys for that store.
+            let mut clone = current_plan.clone();
+            clone.apply_store_shard(shard, &store)?;
+
+            let handle = tokio::spawn(Self::single_store_shard_handler(
+                pd_client.clone(),
+                clone,
+                backoff.clone(),
+                permits.clone(),
+                preserve_store_results,
+            ));
+            handles.push(handle);
+        }
+
+        let results = try_join_all(handles)
+            .await
+            .map_err(|e| Error::InternalError {
+                message: format!("Failed to join task: {}", e),
+            })?;
+        if preserve_store_results {
+            Ok(results
+                .into_iter()
+                .flat_map_ok(|x| x)
+                .map(|x| match x {
+                    Ok(r) => r,
+                    Err(e) => Err(e),
+                })
+                .collect())
+        } else {
+            Ok(results
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect())
+        }
+    }
+
+    #[async_recursion]
+    async fn single_store_shard_handler(
+        pd_client: Arc<PdC>,
+        plan: P,
+        mut backoff: Backoff,
+        permits: Arc<Semaphore>,
+        preserve_store_results: bool,
+    ) -> Result<<Self as Plan>::Result> {
+        let permit = permits.acquire().await.unwrap();
+
+        let res = plan.execute().await;
+        drop(permit);
+
+        let mut resp = match res {
+            Ok(resp) => resp,
+            Err(e) if is_grpc_error(&e) => {
+                info!("gRPC error: {:?}, retrying...", e);
+                match backoff.next_delay_duration() {
+                    Some(duration) => {
+                        sleep(duration).await;
+                        return Self::store_plan_handler(
+                            pd_client,
+                            plan,
+                            backoff,
+                            permits,
+                            preserve_store_results,
+                        )
+                        .await;
+                    }
+                    None => {
+                        info!("Max retry attempts reached for gRPC error");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Handle key errors
+        if let Some(key_errors) = resp.key_errors() {
+            return Ok(vec![Err(Error::MultipleKeyErrors(key_errors))]);
+        }
+
+        // Handle region errors
+        if let Some(region_error) = resp.region_error() {
+            info!("Region error encountered: {:?}", region_error);
+            match backoff.next_delay_duration() {
+                Some(duration) => {
+                    // Invalidate affected region caches
+                    let region_error_resolved = Self::handle_store_region_error(pd_client.clone(), &region_error).await?;
+                    // don't sleep if we have resolved the region error
+                    if !region_error_resolved {
+                        sleep(duration).await;
+                    }
+                    Self::store_plan_handler(
+                        pd_client,
+                        plan,
+                        backoff,
+                        permits,
+                        preserve_store_results,
+                    )
+                    .await
+                }
+                None => {
+                    info!("Max retry attempts reached for region error");
+                    Err(Error::RegionError(Box::new(region_error)))
+                }
+            }
+        } else {
+            Ok(vec![Ok(resp)])
+        }
+    }
+
+    // Returns
+    // 1. Ok(true): error has been resolved, retry immediately
+    // 2. Ok(false): backoff, and then retry
+    // 3. Err(Error): can't be resolved, return the error to upper level
+    async fn handle_store_region_error(
+        pd_client: Arc<PdC>,
+        error: &errorpb::Error,
+    ) -> Result<bool> {
+        let mut retry_immediately = true;
+        // For store-level region errors, we can't easily determine the specific region
+        // Just log the error - the retry logic will handle fetching fresh region info
+        info!("Store region error encountered: {:?}", error);
+        if let Some(multi_region_error) = &error.multi_region_error {
+            for region_error in &multi_region_error.errors {
+                let region_id = region_error.region_id;
+                let region_with_leader = pd_client.clone().region_for_id(region_id).await?;
+                let region_store = pd_client
+                    .clone()
+                    .map_region_to_store(region_with_leader)
+                    .await?;
+                let res = handle_region_error(
+                    pd_client.clone(),
+                    region_error.error.clone().unwrap(),
+                    // get region store from PD client
+                    region_store,
+                )
+                .await?;
+                if !res {
+                    retry_immediately = false;
+                }
+            }
+        } else {
+            info!("No multi_region_error field found in store region error");
+        }
+
+        Ok(retry_immediately)
     }
 }
 

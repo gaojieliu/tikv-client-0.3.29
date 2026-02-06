@@ -13,6 +13,7 @@ use crate::request::Plan;
 use crate::request::ResolveLock;
 use crate::store::RegionStore;
 use crate::store::Request;
+use crate::store::Store;
 use crate::Result;
 use std::fmt::Debug;
 
@@ -42,6 +43,17 @@ pub trait Shardable {
     ) -> BoxStream<'static, Result<(Self::Shard, RegionStore)>>;
 
     fn apply_shard(&mut self, shard: Self::Shard, store: &RegionStore) -> Result<()>;
+}
+
+pub trait StoreShardable {
+    type StoreShard: Clone + Send + Sync + 'static;
+    
+    fn store_shards(
+        &self,
+        pd_client: &Arc<impl PdClient>,
+    ) -> BoxStream<'static, Result<(Self::StoreShard, Store)>>;
+    
+    fn apply_store_shard(&mut self, shard: Self::StoreShard, store: &Store) -> Result<()>;
 }
 
 pub trait Batchable {
@@ -95,6 +107,22 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
     fn apply_shard(&mut self, shard: Self::Shard, store: &RegionStore) -> Result<()> {
         self.kv_client = Some(store.client.clone());
         self.request.apply_shard(shard, store)
+    }
+}
+
+impl<Req: KvRequest + StoreShardable> StoreShardable for Dispatch<Req> {
+    type StoreShard = Req::StoreShard;
+
+    fn store_shards(
+        &self,
+        pd_client: &Arc<impl PdClient>,
+    ) -> BoxStream<'static, Result<(Self::StoreShard, Store)>> {
+        self.request.store_shards(pd_client)
+    }
+
+    fn apply_store_shard(&mut self, shard: Self::StoreShard, store: &Store) -> Result<()> {
+        self.kv_client = Some(store.client.clone());
+        self.request.apply_store_shard(shard, store)
     }
 }
 

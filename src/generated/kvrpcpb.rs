@@ -827,6 +827,8 @@ pub struct RawBatchGetOptimizedRequest {
     pub cf: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]
     pub regions: ::prost::alloc::vec::Vec<RegionKeys>,
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

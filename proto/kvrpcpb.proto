@@ -588,6 +588,7 @@ message RawBatchGetOptimizedRequest {
     Context context = 1;
     string cf = 2;
     repeated RegionKeys regions = 3;
+    repeated bytes keys = 4;
 }
 
 

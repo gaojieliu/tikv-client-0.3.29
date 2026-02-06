@@ -207,6 +207,20 @@ pub struct MismatchPeerId {
     #[prost(uint64, tag = "2")]
     pub store_peer_id: u64,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegionError {
+    #[prost(uint64, tag = "1")]
+    pub region_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MultiRegionError {
+    #[prost(message, repeated, tag = "1")]
+    pub errors: ::prost::alloc::vec::Vec<RegionError>,
+}
 /// Error wraps all region errors, indicates an error encountered by a request.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -263,4 +277,7 @@ pub struct Error {
     /// BucketVersionNotMatch is the error variant that tells the request buckets version is not match.
     #[prost(message, optional, tag = "21")]
     pub bucket_version_not_match: ::core::option::Option<BucketVersionNotMatch>,
+    /// Multi region error to keep a list of region-level error
+    #[prost(message, optional, tag = "22")]
+    pub multi_region_error: ::core::option::Option<MultiRegionError>,
 }
