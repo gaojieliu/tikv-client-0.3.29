@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,10 +33,25 @@ impl KvConnect for TikvConnect {
     type KvClient = KvRpcClient;
 
     async fn connect(&self, address: &str) -> Result<KvRpcClient> {
-        self.security_mgr
-            .connect(address, TikvClient::new)
-            .await
-            .map(|c| KvRpcClient::new(c, self.timeout))
+                // Create a list of clients to support multiple concurrent requests. 
+        let mut rpc_clients = Vec::new();
+        // 10 conns by default
+        for _ in 0..9 {
+            let rpc_client = self.security_mgr
+                .connect(address, TikvClient::new)
+                .await?;
+            rpc_clients.push(rpc_client);
+        }
+        // self.security_mgr
+        //     .connect(address, TikvClient::new)
+        //     .await
+        //     .map(|c| KvRpcClient::new(c, self.timeout))
+        log::info!("Created 10 connections to TiKV at {}", address);
+        Ok(KvRpcClient {
+            rpc_clients,
+            timeout: self.timeout,
+            store_request_id: Arc::new(AtomicU64::new(0)),
+        })
     }
 }
 
@@ -48,13 +64,23 @@ pub trait KvClient {
 /// types and abstractions of the client program into the grpc data types.
 #[derive(new, Clone)]
 pub struct KvRpcClient {
-    rpc_client: TikvClient<Channel>,
+    //rpc_client: TikvClient<Channel>,
+    // Create a list of clients to support multiple concurrent requests.
+    rpc_clients: Vec<TikvClient<Channel>>,
     timeout: Duration,
+    store_request_id: Arc<AtomicU64>,
+}
+
+impl KvRpcClient {
+    fn next_request_id(&self) -> u64 {
+        self.store_request_id.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl KvClient for KvRpcClient {
+
     async fn dispatch(&self, request: &dyn Request) -> Result<Box<dyn Any>> {
-        request.dispatch(&self.rpc_client, self.timeout).await
+        request.dispatch(&self.rpc_clients[self.next_request_id() as usize % self.rpc_clients.len()], self.timeout).await
     }
 }
