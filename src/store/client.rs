@@ -36,7 +36,9 @@ impl KvConnect for TikvConnect {
                 // Create a list of clients to support multiple concurrent requests. 
         let mut rpc_clients = Vec::new();
         // 10 conns by default
-        for _ in 0..9 {
+        for _ in 0..10 {
+            // Sleep for some time to avoid overwhelming the server with connection attempts.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let rpc_client = self.security_mgr
                 .connect(address, TikvClient::new)
                 .await?;

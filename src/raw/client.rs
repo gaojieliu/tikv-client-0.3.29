@@ -124,6 +124,11 @@ impl Client<PdRpcClient> {
             }
             None => Keyspace::Disable,
         };
+        // Random sleep to avoid thundering herd problem when multiple clients start at the same time.
+        let sleep_duration = std::time::Duration::from_millis(rand::random::<u64>() % 5000);
+        sleep(sleep_duration).await;
+        // Warm up connections
+        rpc.all_stores().await?;
         Ok(Client {
             rpc,
             cf: None,
