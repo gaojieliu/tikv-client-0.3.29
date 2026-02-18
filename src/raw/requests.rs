@@ -46,6 +46,10 @@ use crate::proto::kvrpcpb::RegionKeys;
 use crate::store::Store;
 use std::mem;
 
+use crate::proto::tikvpb;
+use crate::store::BatchDispatchable;
+use crate::Error;
+
 pub fn new_raw_get_request(key: Vec<u8>, cf: Option<ColumnFamily>) -> kvrpcpb::RawGetRequest {
     let mut req = kvrpcpb::RawGetRequest::default();
     req.key = key;
@@ -157,6 +161,42 @@ impl StoreShardable for kvrpcpb::RawBatchGetOptimizedRequest {
     
     fn get_store_shard_region_ids(&self) -> Vec<u64> {
         self.regions.iter().map(|region_keys| region_keys.region_id).collect()
+    }
+}
+
+#[async_trait]
+impl BatchDispatchable for kvrpcpb::RawBatchGetRequest {
+    fn to_batch_request(&self, _request_id: u64) -> tikvpb::batch_commands_request::Request {
+        tikvpb::batch_commands_request::Request {
+            cmd: Some(tikvpb::batch_commands_request::request::Cmd::RawBatchGet(
+                self.clone(),
+            )),
+        }
+    }
+
+    fn from_batch_response(
+        response: &tikvpb::batch_commands_response::Response,
+    ) -> Result<Box<dyn Any + Send>> {
+        match &response.cmd {
+            Some(tikvpb::batch_commands_response::response::Cmd::RawBatchGet(resp)) => {
+                // Check for region-level errors first
+                use crate::store::{HasKeyErrors, HasRegionError};
+                let mut resp_clone = resp.clone();
+
+                if let Some(region_error) = resp_clone.region_error() {
+                    return Err(Error::RegionError(Box::new(region_error)));
+                }
+
+                if let Some(key_errors) = resp_clone.key_errors() {
+                    return Err(Error::MultipleKeyErrors(key_errors));
+                }
+
+                Ok(Box::new(resp_clone) as Box<dyn Any + Send>)
+            }
+            _ => Err(Error::StringError(
+                "Expected RawBatchGetResponse from batch command".to_string(),
+            )),
+        }
     }
 }
 

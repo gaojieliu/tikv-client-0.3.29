@@ -1,5 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+mod batch_commands;
 mod client;
 mod errors;
 mod request;
@@ -12,12 +13,14 @@ use derive_new::new;
 use futures::prelude::*;
 use futures::stream::BoxStream;
 
+pub use self::batch_commands::dispatch_batch;
 pub use self::client::KvClient;
 pub use self::client::KvConnect;
 pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
 pub use self::errors::HasRegionErrors;
+pub use self::request::BatchDispatchable;
 pub use self::request::Request;
 use crate::pd::PdClient;
 use crate::proto::kvrpcpb;
@@ -190,4 +193,57 @@ pub fn store_stream_for_ranges<PdC: PdClient>(
                 .map_ok(move |store| (range, store))
         })
         .boxed()
+}
+
+
+/// Group shards by their destination store ID.
+///
+/// Takes a vector of shards (each containing data and a RegionStore) and groups them
+/// by the store ID of their leader peer. This enables batching multiple region-level
+/// requests destined for the same TiKV store into a single batch command.
+///
+/// # Arguments
+///
+/// * `shards` - Vector of Results containing tuples of (shard data, RegionStore)
+///
+/// # Returns
+///
+/// A HashMap where keys are store IDs and values are vectors of (shard, RegionStore) tuples
+/// for that store.
+///
+/// # Errors
+///
+/// Returns an error if any shard is an Err, or if any RegionStore doesn't have a leader peer.
+pub fn group_shards_by_store<S>(
+    shards: Vec<Result<(S, RegionStore)>>,
+) -> Result<std::collections::HashMap<u64, Vec<(S, RegionStore)>>>
+where
+    S: Clone + Send + Sync,
+{
+    use std::collections::HashMap;
+
+    let mut grouped: HashMap<u64, Vec<(S, RegionStore)>> = HashMap::new();
+
+    for shard_result in shards {
+        let (shard, region_store) = shard_result?;
+
+        // Extract store ID from the leader peer
+        let store_id = region_store
+            .region_with_leader
+            .leader
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::LeaderNotFound {
+                    region_id: region_store.region_with_leader.region.id,
+                }
+            })?
+            .store_id;
+
+        grouped
+            .entry(store_id)
+            .or_insert_with(Vec::new)
+            .push((shard, region_store));
+    }
+
+    Ok(grouped)
 }

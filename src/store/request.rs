@@ -8,6 +8,7 @@ use tonic::transport::Channel;
 use tonic::IntoRequest;
 
 use crate::proto::kvrpcpb;
+use crate::proto::tikvpb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::store::RegionWithLeader;
 use crate::Error;
@@ -24,6 +25,24 @@ pub trait Request: Any + Sync + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()>;
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion);
+}
+
+/// Trait for requests that can be dispatched using BatchCommandsRequest.
+///
+/// Requests implementing this trait can be batched together when multiple
+/// region-level requests are destined for the same TiKV store, reducing
+/// RPC count and improving throughput.
+#[async_trait]
+pub trait BatchDispatchable: Request {
+    /// Convert this request into a BatchCommands request component.
+    fn to_batch_request(&self, request_id: u64) -> tikvpb::batch_commands_request::Request;
+
+    /// Extract response from BatchCommands response.
+    ///
+    /// Returns an error if the response type doesn't match the expected type.
+    fn from_batch_response(
+        response: &tikvpb::batch_commands_response::Response,
+    ) -> Result<Box<dyn Any + Send>>;
 }
 
 macro_rules! impl_request {

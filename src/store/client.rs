@@ -60,6 +60,16 @@ impl KvConnect for TikvConnect {
 #[async_trait]
 pub trait KvClient {
     async fn dispatch(&self, req: &dyn Request) -> Result<Box<dyn Any>>;
+
+    /// Try to get the underlying TikvClient if this is a KvRpcClient
+    fn as_tikv_client(&self) -> Option<&TikvClient<Channel>> {
+        None
+    }
+
+    /// Get the timeout duration for this client
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(60) // Default timeout
+    }
 }
 
 /// This client handles requests for a single TiKV node. It converts the data
@@ -84,5 +94,13 @@ impl KvClient for KvRpcClient {
 
     async fn dispatch(&self, request: &dyn Request) -> Result<Box<dyn Any>> {
         request.dispatch(&self.rpc_clients[self.next_request_id() as usize % self.rpc_clients.len()], self.timeout).await
+    }
+
+    fn as_tikv_client(&self) -> Option<&TikvClient<Channel>> {
+        Some(&self.rpc_clients[self.next_request_id() as usize % self.rpc_clients.len()])
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
     }
 }

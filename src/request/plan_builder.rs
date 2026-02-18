@@ -7,6 +7,7 @@ use super::plan::PreserveShard;
 use super::Keyspace;
 use crate::backoff::Backoff;
 use crate::pd::PdClient;
+use crate::proto::kvrpcpb;
 use crate::request::plan::{CleanupLocks, RetryableAllStores};
 use crate::request::shard::HasNextBatch;
 use crate::request::{Dispatch, StoreShardable};
@@ -21,6 +22,7 @@ use crate::request::ProcessResponse;
 use crate::request::ResolveLock;
 use crate::request::RetryableMultiRegion;
 use crate::request::RetryableMultiStore;
+use crate::request::RetryableMultiRegionWithBatchCommand;
 use crate::request::Shardable;
 use crate::request::{DefaultProcessor, StoreRequest};
 use crate::store::HasKeyErrors;
@@ -148,6 +150,27 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
             plan: ProcessResponse {
                 inner: self.plan,
                 processor: DefaultProcessor,
+            },
+            phantom: PhantomData,
+        }
+    }
+}
+
+// Specialized implementation for RawBatchGetRequest with batch command support
+impl<PdC: PdClient> PlanBuilder<PdC, Dispatch<kvrpcpb::RawBatchGetRequest>, NoTarget> {
+    /// Split the request into shards sending a request to a store with batch command optimization.
+    /// This method is specifically for RawBatchGetRequest.
+    pub fn retry_multi_region_with_batch_command(
+        self,
+        backoff: Backoff,
+    ) -> PlanBuilder<PdC, RetryableMultiRegionWithBatchCommand<PdC>, Targetted> {
+        PlanBuilder {
+            pd_client: self.pd_client.clone(),
+            plan: RetryableMultiRegionWithBatchCommand {
+                inner: self.plan,
+                pd_client: self.pd_client,
+                backoff,
+                preserve_region_results: false,
             },
             phantom: PhantomData,
         }

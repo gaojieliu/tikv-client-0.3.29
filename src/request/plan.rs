@@ -9,6 +9,7 @@ use futures::future::try_join_all;
 use futures::prelude::*;
 use log::debug;
 use log::info;
+use log::warn;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
@@ -33,7 +34,7 @@ use crate::transaction::HasLocks;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
 use crate::util::iter::FlatMapOkIterExt;
-use crate::{Error, region};
+use crate::Error;
 use crate::Result;
 
 use super::keyspace::Keyspace;
@@ -598,6 +599,259 @@ where
 
         Ok(retry_immediately)
     }
+}
+
+pub struct RetryableMultiRegionWithBatchCommand<PdC: PdClient> {
+    pub(super) inner: Dispatch<kvrpcpb::RawBatchGetRequest>,
+    pub pd_client: Arc<PdC>,
+    pub backoff: Backoff,
+
+    /// Preserve all regions' results for other downstream plans to handle.
+    /// If true, return Ok and preserve all regions' results, even if some of them are Err.
+    /// Otherwise, return the first Err if there is any.
+    pub preserve_region_results: bool,
+}
+
+
+impl<PdC: PdClient> Clone for RetryableMultiRegionWithBatchCommand<PdC> {
+    fn clone(&self) -> Self {
+        RetryableMultiRegionWithBatchCommand {
+            inner: self.inner.clone(),
+            pd_client: self.pd_client.clone(),
+            backoff: self.backoff.clone(),
+            preserve_region_results: self.preserve_region_results,
+        }
+    }
+}
+
+#[async_trait]
+impl<PdC: PdClient> Plan for RetryableMultiRegionWithBatchCommand<PdC> {
+    type Result = Vec<Result<kvrpcpb::RawBatchGetResponse>>;
+
+    async fn execute(&self) -> Result<Self::Result> {
+        // Limit the maximum concurrency of multi-store request. If there are
+        // too many concurrent requests, TiKV is more likely to return a "TiKV
+        // is busy" error
+        let concurrency_permits = Arc::new(Semaphore::new(MULTI_STORES_CONCURRENCY));
+        Self::single_plan_handler(
+            self.pd_client.clone(),
+            self.inner.clone(),
+            self.backoff.clone(),
+            concurrency_permits.clone(),
+            self.preserve_region_results,
+        )
+        .await
+    }
+}
+
+// Helper function to actually execute batch dispatch for RawBatchGetRequest
+async fn execute_raw_batch_get_batch(
+    plans: Vec<Dispatch<kvrpcpb::RawBatchGetRequest>>,
+    store: &RegionStore,
+) -> Result<Vec<Result<kvrpcpb::RawBatchGetResponse>>> {
+    use crate::store::dispatch_batch;
+
+    // Extract requests
+    let requests: Vec<kvrpcpb::RawBatchGetRequest> =
+        plans.iter().map(|p| p.request.clone()).collect();
+
+    // Get the TikvClient
+    let kv_client = store.client.as_tikv_client()
+        .ok_or_else(|| Error::StringError("KvClient is not a TikvClient".to_string()))?;
+
+    // Get timeout from the store's client
+    let timeout = store.client.timeout();
+
+    // Call dispatch_batch
+    let results = dispatch_batch(kv_client, requests, timeout).await?;
+
+    // Downcast each result to RawBatchGetResponse and collect
+    Ok(results.into_iter()
+        .map(|result| {
+            result.and_then(|any_box| {
+                any_box.downcast::<kvrpcpb::RawBatchGetResponse>()
+                    .map(|boxed| *boxed)
+                    .map_err(|_| Error::StringError("Failed to downcast batch response".to_string()))
+            })
+        })
+        .collect())
+}
+
+impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
+    // Check if an error is a region error that should be retried
+    fn is_region_error(error: &Error) -> bool {
+        matches!(error, Error::RegionError(_))
+    }
+
+    // Helper function to attempt batching requests to the same store
+    async fn try_batch_execute_store_shards(
+        pd_client: Arc<PdC>,
+        current_plan: Dispatch<kvrpcpb::RawBatchGetRequest>,
+        store_shards: Vec<(Vec<Vec<u8>>, RegionStore)>,
+        backoff: Backoff,
+        permits: Arc<Semaphore>,
+        preserve_region_results: bool,
+    ) -> Result<Vec<Result<kvrpcpb::RawBatchGetResponse>>> {
+        println!("Attempting batch dispatch with {} shards", store_shards.len());
+        
+        // Build individual plans with shards applied
+        let mut plans_with_stores = Vec::new();
+        for (shard, region_store) in store_shards {
+            let mut clone = current_plan.clone();
+            clone.apply_shard(shard, &region_store)?;
+            plans_with_stores.push((clone, region_store));
+        }
+
+        // Extract the store from the first shard
+        let first_store = &plans_with_stores[0].1;
+        
+        // Extract plans - no unsafe code needed!
+        let raw_batch_get_plans: Vec<Dispatch<kvrpcpb::RawBatchGetRequest>> =
+            plans_with_stores.iter()
+                .map(|(plan, _)| plan.clone())
+                .collect();
+
+        // Call batch dispatch
+        match execute_raw_batch_get_batch(raw_batch_get_plans, first_store).await {
+            Ok(responses) => {
+                println!("Batch dispatch completed, processing {} responses", responses.len());
+                let mut final_results = Vec::new();
+                let mut retry_indices = Vec::new();
+
+                for (idx, result) in responses.into_iter().enumerate() {
+                    let is_region_err = matches!(&result, Err(e) if Self::is_region_error(e));
+
+                    if is_region_err {
+                        debug!("Region error in batch response at index {}, will retry", idx);
+                        retry_indices.push(idx);
+                    }
+
+                    final_results.push(result);
+                }
+
+                // Retry failed requests individually
+                if !retry_indices.is_empty() {
+                    warn!("Batch had {} region errors, but retry logic is not implemented yet, returning errors directly", retry_indices.len());
+                    return Err(Error::StringError(format!("Batch had {} region errors, retrying individually", retry_indices.len())));
+                }
+
+                Ok(final_results)
+            }
+            Err(e) => {
+                warn!("Batch dispatch failed: {:?}", e);
+                Err(Error::StringError(format!("Batch dispatch failed: {:?}", e)))
+            }
+        }
+
+        //     // Fall back to individual processing if batching didn't work
+        //     let mut handles = Vec::new();
+        //     for (plan, region_store) in plans_with_stores {
+        //         let handle = tokio::spawn(Self::single_shard_handler(
+        //             pd_client.clone(),
+        //             plan,
+        //             region_store,
+        //             backoff.clone(),
+        //             permits.clone(),
+        //             preserve_region_results,
+        //             use_batch_commands,
+        //         ));
+        //         handles.push(handle);
+        //     }
+
+        //     let results = try_join_all(handles).await.map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
+        //     // results is Vec<Result<Vec<Result<P::Result>>>>
+        //     // Flatten it into Vec<Result<P::Result>>
+        //     Ok(results.into_iter()
+        //         .collect::<Result<Vec<_>>>()?  // Convert to Result<Vec<Vec<Result<P::Result>>>>
+        //         .into_iter()
+        //         .flat_map(|v| v)  // Flatten the outer Vec
+        //         .collect())
+        // } else {
+        //     // Process individually
+        //     let mut handles = Vec::new();
+        //     for (shard, region_store) in store_shards {
+        //         let mut clone = current_plan.clone();
+        //         clone.apply_shard(shard, &region_store)?;
+        //         let handle = tokio::spawn(Self::single_shard_handler(
+        //             pd_client.clone(),
+        //             clone,
+        //             region_store,
+        //             backoff.clone(),
+        //             permits.clone(),
+        //             preserve_region_results,
+        //             use_batch_commands,
+        //         ));
+        //         handles.push(handle);
+        //     }
+
+        //     let results = try_join_all(handles).await.map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
+        //     // results is Vec<Result<Vec<Result<P::Result>>>>
+        //     // Flatten it into Vec<Result<P::Result>>
+        //     Ok(results.into_iter()
+        //         .collect::<Result<Vec<_>>>()?  // Convert to Result<Vec<Vec<Result<P::Result>>>>
+        //         .into_iter()
+        //         .flat_map(|v| v)  // Flatten the outer Vec
+        //         .collect())
+        // }
+    }
+
+    // A plan may involve multiple shards
+    #[async_recursion]
+    async fn single_plan_handler(
+        pd_client: Arc<PdC>,
+        current_plan: Dispatch<kvrpcpb::RawBatchGetRequest>,
+        backoff: Backoff,
+        permits: Arc<Semaphore>,
+        preserve_region_results: bool,
+    ) -> Result<<Self as Plan>::Result> {
+        let shards = current_plan.shards(&pd_client).collect::<Vec<_>>().await;
+        let shard_vec: Vec<_> = shards.into_iter().collect::<Result<Vec<_>>>()?;
+        let grouped = crate::store::group_shards_by_store(shard_vec.into_iter().map(Ok).collect())?;
+
+        // Process each store's shards concurrently with potential batching
+        // Each store can be processed in parallel since they're independent
+        let mut handles = Vec::new();
+        for (store_id, store_shards) in grouped {
+            let pd_client_clone = pd_client.clone();
+            let current_plan_clone = current_plan.clone();
+            let backoff_clone = backoff.clone();
+            let permits_clone = permits.clone();
+
+            let handle = tokio::spawn(async move {
+                println!("Sending a batch command to store: {}", store_id);
+                Self::try_batch_execute_store_shards(
+                    pd_client_clone,
+                    current_plan_clone,
+                    store_shards,
+                    backoff_clone,
+                    permits_clone,
+                    preserve_region_results,
+                ).await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all stores to complete
+        let store_results = try_join_all(handles).await
+            .map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
+
+        // Flatten results from all stores
+        let mut all_results = Vec::new();
+        for result in store_results {
+            all_results.extend(result?);
+        }
+
+        if preserve_region_results {
+            Ok(all_results)
+        } else {
+            // Fail fast on first error
+            let checked: Vec<kvrpcpb::RawBatchGetResponse> = all_results
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            Ok(checked.into_iter().map(Ok).collect())
+        }
+    }
+
 }
 
 pub struct RetryableAllStores<P: Plan, PdC: PdClient> {

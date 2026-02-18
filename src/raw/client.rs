@@ -24,7 +24,7 @@ use crate::request::Keyspace;
 use crate::request::Plan;
 use crate::request::TruncateKeyspace;
 use crate::request::{plan, Collect};
-use crate::store::{HasRegionError, RegionStore, Request, Store};
+use crate::store::{HasRegionError, RegionStore, Store};
 use crate::BoundRange;
 use crate::ColumnFamily;
 use crate::Error::{RegionError, StringError};
@@ -289,6 +289,29 @@ impl<PdC: PdClient> Client<PdC> {
                 .collect()
         })
     }
+
+    pub async fn batch_get_with_batch_command(
+        &self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> Result<Vec<KvPair>> {
+        debug!("invoking raw batch_get_with_batch_command request");
+        println!("invoking raw batch_get_with_batch_command request");
+
+        let keys = keys
+            .into_iter()
+            .map(|k| k.into().encode_keyspace(self.keyspace, KeyMode::Raw));
+        let request = new_raw_batch_get_request(keys, self.cf.clone());
+        let plan = crate::request::PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .retry_multi_region_with_batch_command(self.backoff.clone())
+            .merge(Collect)
+            .plan();
+        plan.execute().await.map(|r| {
+            r.into_iter()
+                .map(|pair| pair.truncate_keyspace(self.keyspace))
+                .collect()
+        })
+    }
+
 
     pub async fn batch_get_optimized_new(
         &self,
