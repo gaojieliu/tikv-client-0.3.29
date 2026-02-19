@@ -678,19 +678,14 @@ async fn execute_raw_batch_get_batch(
 }
 
 impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
-    // Check if an error is a region error that should be retried
-    fn is_region_error(error: &Error) -> bool {
-        matches!(error, Error::RegionError(_))
-    }
-
     // Helper function to attempt batching requests to the same store
     async fn try_batch_execute_store_shards(
         pd_client: Arc<PdC>,
         current_plan: Dispatch<kvrpcpb::RawBatchGetRequest>,
         store_shards: Vec<(Vec<Vec<u8>>, RegionStore)>,
-        backoff: Backoff,
+        mut backoff: Backoff,
         permits: Arc<Semaphore>,
-        preserve_region_results: bool,
+        _preserve_region_results: bool,
     ) -> Result<Vec<Result<kvrpcpb::RawBatchGetResponse>>> {
         // Build individual plans with shards applied
         let mut plans_with_stores = Vec::new();
@@ -702,8 +697,8 @@ impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
 
         // Extract the store from the first shard
         let first_store = &plans_with_stores[0].1;
-        
-        // Extract plans - no unsafe code needed!
+
+        // Extract plans
         let raw_batch_get_plans: Vec<Dispatch<kvrpcpb::RawBatchGetRequest>> =
             plans_with_stores.iter()
                 .map(|(plan, _)| plan.clone())
@@ -711,85 +706,187 @@ impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
 
         // Call batch dispatch
         match execute_raw_batch_get_batch(raw_batch_get_plans, first_store).await {
-            Ok(responses) => {
-                let mut final_results = Vec::new();
-                let mut retry_indices = Vec::new();
+            Ok(mut responses) => {
+                let num_responses = responses.len();
+                let mut final_results: Vec<Option<Result<kvrpcpb::RawBatchGetResponse>>> =
+                    (0..num_responses).map(|_| None).collect();
+
+                // Collect failed shards: (plan, region_store, original_idx, region_error)
+                let mut failed_shards: Vec<(Dispatch<kvrpcpb::RawBatchGetRequest>, RegionStore, usize, errorpb::Error)> = Vec::new();
 
                 for (idx, result) in responses.into_iter().enumerate() {
-                    let is_region_err = matches!(&result, Err(e) if Self::is_region_error(e));
-
-                    if is_region_err {
-                        debug!("Region error in batch response at index {}, will retry", idx);
-                        retry_indices.push(idx);
+                    match result {
+                        Err(Error::RegionError(ref e)) => {
+                            debug!("Region error at index {}, will retry: {:?}", idx, e);
+                            let (plan, region_store) = plans_with_stores[idx].clone();
+                            failed_shards.push((plan, region_store, idx, (**e).clone()));
+                        }
+                        Err(ref e) if is_grpc_error(e) => {
+                            debug!("GRPC error at index {}, will retry: {:?}", idx, e);
+                            // For GRPC errors, we also need to retry, but we don't have a region error
+                            // Create a placeholder region error for tracking
+                            let (plan, region_store) = plans_with_stores[idx].clone();
+                            // Use an empty error - the important thing is that we invalidate the cache
+                            failed_shards.push((plan, region_store, idx, errorpb::Error::default()));
+                        }
+                        Ok(mut resp) => {
+                            // Check if the response itself contains a region error
+                            use crate::store::HasRegionError;
+                            if let Some(region_error) = resp.region_error() {
+                                debug!("Response at index {} contains region error, will retry: {:?}", idx, region_error);
+                                let (plan, region_store) = plans_with_stores[idx].clone();
+                                failed_shards.push((plan, region_store, idx, region_error));
+                            } else {
+                                final_results[idx] = Some(Ok(resp));
+                            }
+                        }
+                        Err(e) => {
+                            // Non-retryable error
+                            final_results[idx] = Some(Err(e));
+                        }
                     }
-
-                    final_results.push(result);
                 }
 
-                // Retry failed requests individually
-                if !retry_indices.is_empty() {
-                    warn!("Batch had {} region errors, but retry logic is not implemented yet, returning errors directly", retry_indices.len());
-                    return Err(Error::StringError(format!("Batch had {} region errors, retrying individually", retry_indices.len())));
+                // Retry loop for failed shards
+                while !failed_shards.is_empty() {
+                    match backoff.next_delay_duration() {
+                        Some(duration) => {
+                            // Resolve errors and invalidate caches
+                            let mut need_backoff = false;
+                            for (_, region_store, _, region_error) in &failed_shards {
+                                // Skip handle_region_error for empty errors (from GRPC)
+                                if region_error.message.is_empty()
+                                    && region_error.not_leader.is_none()
+                                    && region_error.region_not_found.is_none()
+                                {
+                                    // For GRPC errors, just invalidate cache
+                                    pd_client.invalidate_region_cache(
+                                        region_store.region_with_leader.ver_id()
+                                    ).await;
+                                    need_backoff = true;
+                                } else {
+                                    match handle_region_error(
+                                        pd_client.clone(),
+                                        region_error.clone(),
+                                        region_store.clone()
+                                    ).await {
+                                        Ok(resolved_immediately) => {
+                                            if !resolved_immediately {
+                                                need_backoff = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Non-recoverable error - this shard fails permanently
+                                            warn!("Non-recoverable region error: {:?}", e);
+                                            // We'll let this fail in the retry below
+                                            need_backoff = true;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if need_backoff {
+                                sleep(duration).await;
+                            }
+
+                            // Retry failed shards individually
+                            let mut retry_handles = Vec::new();
+                            for (plan, _region_store, idx, _) in failed_shards.drain(..) {
+                                let permits_clone = permits.clone();
+                                retry_handles.push(tokio::spawn(async move {
+                                    let permit = permits_clone.acquire().await.unwrap();
+                                    let result = plan.execute().await;
+                                    drop(permit);
+                                    (idx, result)
+                                }));
+                            }
+
+                            let retry_results = try_join_all(retry_handles).await
+                                .map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
+
+                            // Process retry results - merge successes, collect new failures
+                            for (idx, result) in retry_results {
+                                match result {
+                                    Ok(resp) => {
+                                        // Check if the response itself has a region error
+                                        use crate::store::HasRegionError;
+                                        let mut resp_clone = resp.clone();
+                                        if let Some(region_error) = resp_clone.region_error() {
+                                            debug!("Retry at index {} returned region error, will retry again", idx);
+                                            let (plan, region_store) = plans_with_stores[idx].clone();
+                                            failed_shards.push((plan, region_store, idx, region_error));
+                                        } else {
+                                            final_results[idx] = Some(Ok(resp));
+                                        }
+                                    }
+                                    Err(Error::RegionError(ref e)) => {
+                                        debug!("Retry at index {} failed with region error, will retry again", idx);
+                                        let (plan, region_store) = plans_with_stores[idx].clone();
+                                        failed_shards.push((plan, region_store, idx, (**e).clone()));
+                                    }
+                                    Err(ref e) if is_grpc_error(e) => {
+                                        debug!("Retry at index {} failed with GRPC error, will retry again", idx);
+                                        let (plan, region_store) = plans_with_stores[idx].clone();
+                                        failed_shards.push((plan, region_store, idx, errorpb::Error::default()));
+                                    }
+                                    Err(e) => {
+                                        // Non-retryable error
+                                        final_results[idx] = Some(Err(e));
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Max retry attempts reached for {} failed shards", failed_shards.len());
+                            // Fill remaining with errors
+                            for (_, _, idx, e) in failed_shards.drain(..) {
+                                final_results[idx] = Some(Err(Error::RegionError(Box::new(e))));
+                            }
+                            break;
+                        }
+                    }
                 }
 
-                Ok(final_results)
+                // Convert Option to actual values
+                Ok(final_results.into_iter()
+                    .map(|opt| opt.expect("All results should be filled"))
+                    .collect())
+            }
+            Err(e) if is_grpc_error(&e) => {
+                // GRPC error on entire batch - invalidate all regions and retry with backoff
+                debug!("Batch GRPC error, invalidating caches and retrying: {:?}", e);
+                for (_, region_store) in &plans_with_stores {
+                    pd_client.invalidate_region_cache(
+                        region_store.region_with_leader.ver_id()
+                    ).await;
+                }
+                match backoff.next_delay_duration() {
+                    Some(duration) => {
+                        sleep(duration).await;
+                        // Retry by recursively calling this function
+                        // We need to reconstruct store_shards from plans_with_stores
+                        let store_shards: Vec<(Vec<Vec<u8>>, RegionStore)> = plans_with_stores
+                            .into_iter()
+                            .map(|(plan, region_store)| {
+                                // Extract keys from the plan's request
+                                (plan.request.keys.clone(), region_store)
+                            })
+                            .collect();
+                        Box::pin(Self::try_batch_execute_store_shards(
+                            pd_client, current_plan, store_shards, backoff, permits, _preserve_region_results
+                        )).await
+                    }
+                    None => {
+                        warn!("Max retry attempts reached for batch GRPC error");
+                        Err(e)
+                    }
+                }
             }
             Err(e) => {
-                warn!("Batch dispatch failed: {:?}", e);
-                Err(Error::StringError(format!("Batch dispatch failed: {:?}", e)))
+                warn!("Batch dispatch failed with non-retryable error: {:?}", e);
+                Err(e)
             }
         }
-
-        //     // Fall back to individual processing if batching didn't work
-        //     let mut handles = Vec::new();
-        //     for (plan, region_store) in plans_with_stores {
-        //         let handle = tokio::spawn(Self::single_shard_handler(
-        //             pd_client.clone(),
-        //             plan,
-        //             region_store,
-        //             backoff.clone(),
-        //             permits.clone(),
-        //             preserve_region_results,
-        //             use_batch_commands,
-        //         ));
-        //         handles.push(handle);
-        //     }
-
-        //     let results = try_join_all(handles).await.map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
-        //     // results is Vec<Result<Vec<Result<P::Result>>>>
-        //     // Flatten it into Vec<Result<P::Result>>
-        //     Ok(results.into_iter()
-        //         .collect::<Result<Vec<_>>>()?  // Convert to Result<Vec<Vec<Result<P::Result>>>>
-        //         .into_iter()
-        //         .flat_map(|v| v)  // Flatten the outer Vec
-        //         .collect())
-        // } else {
-        //     // Process individually
-        //     let mut handles = Vec::new();
-        //     for (shard, region_store) in store_shards {
-        //         let mut clone = current_plan.clone();
-        //         clone.apply_shard(shard, &region_store)?;
-        //         let handle = tokio::spawn(Self::single_shard_handler(
-        //             pd_client.clone(),
-        //             clone,
-        //             region_store,
-        //             backoff.clone(),
-        //             permits.clone(),
-        //             preserve_region_results,
-        //             use_batch_commands,
-        //         ));
-        //         handles.push(handle);
-        //     }
-
-        //     let results = try_join_all(handles).await.map_err(|e| Error::StringError(format!("Join error: {}", e)))?;
-        //     // results is Vec<Result<Vec<Result<P::Result>>>>
-        //     // Flatten it into Vec<Result<P::Result>>
-        //     Ok(results.into_iter()
-        //         .collect::<Result<Vec<_>>>()?  // Convert to Result<Vec<Vec<Result<P::Result>>>>
-        //         .into_iter()
-        //         .flat_map(|v| v)  // Flatten the outer Vec
-        //         .collect())
-        // }
     }
 
     // A plan may involve multiple shards
