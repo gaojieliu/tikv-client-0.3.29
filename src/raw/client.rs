@@ -295,7 +295,6 @@ impl<PdC: PdClient> Client<PdC> {
         keys: impl IntoIterator<Item = impl Into<Key>>,
     ) -> Result<Vec<KvPair>> {
         debug!("invoking raw batch_get_with_batch_command request");
-        println!("invoking raw batch_get_with_batch_command request");
 
         let keys = keys
             .into_iter()

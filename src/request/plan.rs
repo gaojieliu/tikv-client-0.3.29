@@ -692,8 +692,6 @@ impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
         permits: Arc<Semaphore>,
         preserve_region_results: bool,
     ) -> Result<Vec<Result<kvrpcpb::RawBatchGetResponse>>> {
-        println!("Attempting batch dispatch with {} shards", store_shards.len());
-        
         // Build individual plans with shards applied
         let mut plans_with_stores = Vec::new();
         for (shard, region_store) in store_shards {
@@ -714,7 +712,6 @@ impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
         // Call batch dispatch
         match execute_raw_batch_get_batch(raw_batch_get_plans, first_store).await {
             Ok(responses) => {
-                println!("Batch dispatch completed, processing {} responses", responses.len());
                 let mut final_results = Vec::new();
                 let mut retry_indices = Vec::new();
 
@@ -818,7 +815,6 @@ impl<PdC: PdClient> RetryableMultiRegionWithBatchCommand<PdC> {
             let permits_clone = permits.clone();
 
             let handle = tokio::spawn(async move {
-                println!("Sending a batch command to store: {}", store_id);
                 Self::try_batch_execute_store_shards(
                     pd_client_clone,
                     current_plan_clone,
