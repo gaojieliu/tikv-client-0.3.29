@@ -42,9 +42,7 @@ use std::time::Duration;
 use tonic::transport::Channel;
 
 use crate::request::StoreShardable;
-use crate::proto::kvrpcpb::RegionKeys;
 use crate::store::Store;
-use std::mem;
 
 use crate::proto::tikvpb;
 use crate::store::BatchDispatchable;
@@ -111,15 +109,19 @@ impl Merge<kvrpcpb::RawBatchGetResponse> for Collect {
     }
 }
 
-pub fn new_raw_batch_get_optimized_request(
-    keys: Vec<Vec<u8>>,
+/// Create a RawBatchGetOptimizedRequest from pre-sharded RegionKeys.
+///
+/// This constructor takes already-sharded RegionKeys where keys have been grouped
+/// by their target region. The top-level `keys` field is intentionally left empty
+/// as all keys are stored in `regions[].keys`.
+pub fn new_raw_batch_get_optimized_request_from_regions(
+    regions: Vec<kvrpcpb::RegionKeys>,
     cf: Option<ColumnFamily>,
 ) -> kvrpcpb::RawBatchGetOptimizedRequest {
     let mut req = kvrpcpb::RawBatchGetOptimizedRequest::default();
-    // Need to find a placeholder to keep all the keys
-    req.keys = keys;
+    req.regions = regions;
+    // keys field intentionally left empty - all keys are in regions
     req.maybe_set_cf(cf);
-
     req
 }
 
@@ -128,39 +130,34 @@ impl KvRequest for kvrpcpb::RawBatchGetOptimizedRequest {
 }
 impl StoreShardable for kvrpcpb::RawBatchGetOptimizedRequest {
     type StoreShard = Vec<kvrpcpb::RegionKeys>;
-    
+
     fn store_shards(
         &self,
         pd_client: &Arc<impl crate::pd::PdClient>,
     ) -> BoxStream<'static, Result<(Self::StoreShard, Store)>> {
-        // TODO: need to get rid of clone to optimize the performance
-        let mut keys: Vec<Vec<u8>> = self.keys.clone();
-        if keys.is_empty() {
-            // Copy keys from the region keys since this could be a retry request, where the original keys are cleared to save bandwidth
-            // when sending request to TiKV server as the full keys are not needed anymore (mainly being used a placeholder for sharding).
-            keys = self
-                .regions
-                .iter()
-                .flat_map(|region_keys| region_keys.keys.iter().cloned())
-                .collect();
-        }
-        
+        // Always extract keys from regions - no more self.keys dependency
+        let keys: Vec<Vec<u8>> = self
+            .regions
+            .iter()
+            .flat_map(|region_keys| region_keys.keys.iter().cloned())
+            .collect();
+
         crate::store::store_stream_for_keys_by_store_with_region_info(
             keys.into_iter(),
             pd_client.clone(),
         )
     }
-    
+
     fn apply_store_shard(&mut self, shard: Self::StoreShard, _store: &Store) -> Result<()> {
-        // self.context = Some(store.context().clone());
-        // We don't need to keep the full keys anymore
-        self.keys.clear();
         self.regions = shard;
         Ok(())
     }
-    
+
     fn get_store_shard_region_ids(&self) -> Vec<u64> {
-        self.regions.iter().map(|region_keys| region_keys.region_id).collect()
+        self.regions
+            .iter()
+            .map(|region_keys| region_keys.region_id)
+            .collect()
     }
 }
 
