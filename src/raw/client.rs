@@ -24,8 +24,7 @@ use crate::request::Keyspace;
 use crate::request::Plan;
 use crate::request::TruncateKeyspace;
 use crate::request::{plan, Collect};
-use crate::raw::requests::new_raw_batch_get_optimized_request_from_regions;
-use crate::store::{preshard_keys_to_regions, HasRegionError, RegionStore, Store};
+use crate::store::{HasRegionError, RegionStore, Store};
 use crate::BoundRange;
 use crate::ColumnFamily;
 use crate::Error::{RegionError, StringError};
@@ -317,15 +316,12 @@ impl<PdC: PdClient> Client<PdC> {
         &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
     ) -> Result<Vec<KvPair>> {
-        let keys: Vec<Vec<u8>> = keys
+        let keys: Vec<Key> = keys
             .into_iter()
-            .map(|k| k.into().encode_keyspace(self.keyspace, KeyMode::Raw).into())
+            .map(|k| k.into().encode_keyspace(self.keyspace, KeyMode::Raw))
             .collect();
 
-        // Pre-shard keys into RegionKeys
-        let regions = preshard_keys_to_regions(keys, self.rpc.clone()).await?;
-
-        let request = new_raw_batch_get_optimized_request_from_regions(regions, self.cf.clone());
+        let request = new_raw_batch_get_optimized_request(keys.into_iter(), self.cf.clone());
         let plan = crate::request::PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
             .retry_multi_store(self.backoff.clone())
             .merge(Collect)

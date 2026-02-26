@@ -33,7 +33,6 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use crate::proto::kvrpcpb::RegionKeys;
 use crate::Error;
-use crate::pd::PdClient as PdClientTrait;
 
 
 #[derive(new, Clone)]
@@ -196,50 +195,6 @@ pub fn store_stream_for_ranges<PdC: PdClient>(
         .boxed()
 }
 
-
-/// Pre-shard keys into RegionKeys grouped by region.
-///
-/// Takes a list of keys and groups them by their target region, returning a vector
-/// of RegionKeys where each entry contains the region metadata and all keys belonging
-/// to that region. This is used to pre-compute sharding before creating requests.
-///
-/// # Arguments
-///
-/// * `keys` - Iterator of keys to shard
-/// * `pd_client` - PD client for looking up region information
-///
-/// # Returns
-///
-/// A vector of RegionKeys, each containing keys for a single region with region metadata.
-pub async fn preshard_keys_to_regions<PdC: PdClientTrait>(
-    keys: Vec<Vec<u8>>,
-    pd_client: Arc<PdC>,
-) -> Result<Vec<RegionKeys>> {
-    let mut region_keys_map: HashMap<u64, RegionKeys> = HashMap::new();
-
-    for key in keys {
-        let key_ref: Key = key.clone().into();
-        let region = pd_client.clone().region_for_key(&key_ref).await?;
-        let leader_peer = region
-            .leader
-            .as_ref()
-            .ok_or(Error::LeaderNotFound { region_id: region.id() })?;
-
-        region_keys_map
-            .entry(region.id())
-            .or_insert_with(|| {
-                let mut rk = RegionKeys::default();
-                rk.region_id = region.id();
-                rk.region_epoch = region.region.region_epoch.clone();
-                rk.peer = Some(leader_peer.clone());
-                rk
-            })
-            .keys
-            .push(key);
-    }
-
-    Ok(region_keys_map.into_values().collect())
-}
 
 /// Group shards by their destination store ID.
 ///

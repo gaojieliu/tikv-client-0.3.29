@@ -109,55 +109,97 @@ impl Merge<kvrpcpb::RawBatchGetResponse> for Collect {
     }
 }
 
-/// Create a RawBatchGetOptimizedRequest from pre-sharded RegionKeys.
+/// Wrapper for RawBatchGetOptimizedRequest that holds keys for sharding.
 ///
-/// This constructor takes already-sharded RegionKeys where keys have been grouped
-/// by their target region. The top-level `keys` field is intentionally left empty
-/// as all keys are stored in `regions[].keys`.
-pub fn new_raw_batch_get_optimized_request_from_regions(
-    regions: Vec<kvrpcpb::RegionKeys>,
-    cf: Option<ColumnFamily>,
-) -> kvrpcpb::RawBatchGetOptimizedRequest {
-    let mut req = kvrpcpb::RawBatchGetOptimizedRequest::default();
-    req.regions = regions;
-    // keys field intentionally left empty - all keys are in regions
-    req.maybe_set_cf(cf);
-    req
+/// This wrapper keeps the original keys separate from the gRPC request, allowing
+/// proper sharding and retry logic. The `keys` field is used for sharding and is
+/// updated after `apply_store_shard` to contain only the keys for that store
+/// (enabling correct retry behavior).
+#[derive(Clone, Default)]
+pub struct RawBatchGetOptimizedRequest {
+    /// Keys for sharding - updated after apply_store_shard to contain only that store's keys
+    keys: Vec<Vec<u8>>,
+    /// The underlying gRPC request
+    inner: kvrpcpb::RawBatchGetOptimizedRequest,
 }
 
-impl KvRequest for kvrpcpb::RawBatchGetOptimizedRequest {
+pub fn new_raw_batch_get_optimized_request(
+    keys: Vec<Vec<u8>>,
+    cf: Option<ColumnFamily>,
+) -> RawBatchGetOptimizedRequest {
+    let mut inner = kvrpcpb::RawBatchGetOptimizedRequest::default();
+    inner.maybe_set_cf(cf);
+    RawBatchGetOptimizedRequest { keys, inner }
+}
+
+#[async_trait]
+impl Request for RawBatchGetOptimizedRequest {
+    async fn dispatch(
+        &self,
+        client: &TikvClient<Channel>,
+        timeout: Duration,
+    ) -> Result<Box<dyn Any>> {
+        self.inner.dispatch(client, timeout).await
+    }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
+        self.inner.set_leader(leader)
+    }
+
+    fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
+        self.inner.set_api_version(api_version);
+    }
+}
+
+impl KvRequest for RawBatchGetOptimizedRequest {
     type Response = kvrpcpb::RawBatchGetResponse;
 }
-impl StoreShardable for kvrpcpb::RawBatchGetOptimizedRequest {
+
+impl StoreShardable for RawBatchGetOptimizedRequest {
     type StoreShard = Vec<kvrpcpb::RegionKeys>;
 
     fn store_shards(
         &self,
         pd_client: &Arc<impl crate::pd::PdClient>,
     ) -> BoxStream<'static, Result<(Self::StoreShard, Store)>> {
-        // Always extract keys from regions - no more self.keys dependency
-        let keys: Vec<Vec<u8>> = self
-            .regions
-            .iter()
-            .flat_map(|region_keys| region_keys.keys.iter().cloned())
-            .collect();
-
+        // Use self.keys for sharding (single source of truth)
         crate::store::store_stream_for_keys_by_store_with_region_info(
-            keys.into_iter(),
+            self.keys.clone().into_iter(),
             pd_client.clone(),
         )
     }
 
     fn apply_store_shard(&mut self, shard: Self::StoreShard, _store: &Store) -> Result<()> {
-        self.regions = shard;
+        // Update keys to only contain keys from this shard (for retry)
+        self.keys = shard
+            .iter()
+            .flat_map(|region_keys| region_keys.keys.clone())
+            .collect();
+        // Set regions on inner request
+        self.inner.regions = shard;
         Ok(())
     }
 
     fn get_store_shard_region_ids(&self) -> Vec<u64> {
-        self.regions
+        self.inner
+            .regions
             .iter()
             .map(|region_keys| region_keys.region_id)
             .collect()
+    }
+}
+
+impl RawRpcRequest for RawBatchGetOptimizedRequest {
+    fn set_cf(&mut self, cf: String) {
+        self.inner.cf = cf;
     }
 }
 

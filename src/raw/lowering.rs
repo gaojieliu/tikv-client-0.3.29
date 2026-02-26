@@ -29,10 +29,10 @@ pub fn new_raw_batch_get_request(
 }
 
 pub fn new_raw_batch_get_optimized_request(
-    regions: Vec<kvrpcpb::RegionKeys>,
+    keys: impl Iterator<Item = Key>,
     cf: Option<ColumnFamily>,
-) -> kvrpcpb::RawBatchGetOptimizedRequest {
-    requests::new_raw_batch_get_optimized_request_from_regions(regions, cf)
+) -> requests::RawBatchGetOptimizedRequest {
+    requests::new_raw_batch_get_optimized_request(keys.map(Into::into).collect(), cf)
 }
 
 pub fn new_raw_get_key_ttl_request(
